@@ -513,12 +513,12 @@ def make_user(name: str, role: str, password: str) -> dict:
 _DEMO_SALT_1 = "8f1d2c3b4a5968778695a4b3c2d1e0f1"
 _DEMO_SALT_2 = "1a2b3c4d5e6f708192a3b4c5d6e7f809"
 DEMO_USERS = {
-    "maria": {"name": "Maria Lopez", "role": "planner", "salt": _DEMO_SALT_1,
+    "yogesh": {"name": "Yogesh", "role": "planner", "salt": _DEMO_SALT_1,
               "password_hash": hash_password("planner123", _DEMO_SALT_1)},
-    "david": {"name": "David Brooks", "role": "approver", "salt": _DEMO_SALT_2,
+    "kshitij": {"name": "Kshitij", "role": "approver", "salt": _DEMO_SALT_2,
               "password_hash": hash_password("approver123", _DEMO_SALT_2)},
 }
-DEMO_PASSWORDS = {"maria": "planner123", "david": "approver123"}
+DEMO_PASSWORDS = {"yogesh": "planner123", "kshitij": "approver123"}
 
 
 def load_users(st_secrets) -> tuple[dict, bool]:
@@ -619,7 +619,7 @@ def login_page():
         st.markdown("## Allocation Planner")
         st.caption("Monthly COM inventory allocation · sign in to continue")
         with st.form("login", border=True):
-            username = st.text_input("Username", placeholder="e.g. maria")
+            username = st.text_input("Username", placeholder="e.g. yogesh")
             password = st.text_input("Password", type="password")
             ok = st.form_submit_button("Sign in", type="primary", width="stretch")
         if ok:
@@ -642,8 +642,8 @@ def login_page():
             with st.expander("Demo accounts"):
                 st.markdown(
                     f"| Role | Username | Password |\n|---|---|---|\n"
-                    f"| Planner | `maria` | `{DEMO_PASSWORDS['maria']}` |\n"
-                    f"| Approver | `david` | `{DEMO_PASSWORDS['david']}` |"
+                    f"| Planner | `yogesh` | `{DEMO_PASSWORDS['yogesh']}` |\n"
+                    f"| Approver | `kshitij` | `{DEMO_PASSWORDS['kshitij']}` |"
                 )
                 st.caption("Replace these with real accounts in Streamlit secrets before sharing widely.")
 
