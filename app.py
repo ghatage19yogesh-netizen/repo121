@@ -572,7 +572,8 @@ import streamlit as st
 st.set_page_config(page_title="Allocation Planner", page_icon=":material/warehouse:", layout="wide")
 
 ss = st.session_state
-PERSIST_KEYS = ["month", "penalty", "time_limit", "tie_break", "cost_fill", "count_rule"]
+PERSIST_KEYS = ["month", "penalty", "time_limit", "tie_break", "cost_fill", "count_rule",
+                "pipe_env", "pipe_month", "pipe_classes", "pipe_use_setup"]
 for _k in PERSIST_KEYS:  # keep widget values when switching pages
     if _k in ss:
         ss[_k] = ss[_k]
@@ -584,10 +585,10 @@ STATUS_BADGE = {
     "Rejected": ":red-badge[Rejected]",
 }
 NAV = {
-    "planner": ["Set up & run", "Plan", "Warnings", "Run history"],
-    "approver": ["Approvals", "Plan", "Warnings", "Run history"],
+    "planner": ["Set up & run", "Pipeline run", "Plan", "Warnings", "Publish to BigQuery", "Run history"],
+    "approver": ["Approvals", "Plan", "Warnings", "Publish to BigQuery", "Run history"],
 }
-ICONS = {"Set up & run": "▶", "Plan": "▦", "Warnings": "!", "Run history": "≡", "Approvals": "✓"}
+ICONS = {"Set up & run": "▶", "Pipeline run": "⚙", "Publish to BigQuery": "⇪", "Plan": "▦", "Warnings": "!", "Run history": "≡", "Approvals": "✓"}
 
 
 def goto(page: str, run_id: str | None = None):
@@ -690,7 +691,8 @@ def pick_run() -> dict | None:
 
 def run_header(run: dict, title: str):
     st.markdown(f"## {title} · {run['month']}")
-    st.markdown(f"{STATUS_BADGE.get(run['status'], run['status'])} &nbsp; "
+    pub = " :violet-badge[Published to BigQuery]" if run.get("publications") else ""
+    st.markdown(f"{STATUS_BADGE.get(run['status'], run['status'])}{pub} &nbsp; "
                 f"<span style='color:#5E5E5A'>{run['id']} · run by {run['created_by']} on {run['created_at']}</span>",
                 unsafe_allow_html=True)
 
@@ -1028,6 +1030,711 @@ def page_history():
 
 
 # ======================================================================================
+# Pipeline run — model_main.py, step by step (demo)
+# ======================================================================================
+import io as _io
+import pickle as _pickle
+
+# Stands in for config.PIPELINE_CONFIG() in the real repo
+PIPELINE_CONFIG = {
+    "PIPELINE_NAME": "scs-com-allocation",
+    "GCP_PROJECT": "[gcp-project]",
+    "BUCKET_NAME": "[allocation-bucket]",
+    "PROJECT_INTERIM_FOLDER": "interim",
+}
+# dept number -> product class (used by split_data_by_class_and_vnd)
+PRODUCT_CLASSES = {"101": "Tops", "202": "Dresses & suits", "305": "Outerwear", "410": "Accessories",
+                   "415": "Accessories", "520": "Hosiery", "610": "Jewellery"}
+GCS_DIR = DATA_DIR / "gcs"  # local folder playing the role of the GCS bucket in this demo
+
+PIPE_STEPS = [
+    ("connect", "Connect to BigQuery", "get_gbq_client(env)"),
+    ("download", "Download query_parameters.pkl", "s_client.download_file_from_gcs(...)"),
+    ("load", "Load pickle", "clf = load_pickle(local_file_path)"),
+    ("unpack", "Unpack sets / params / options / constraints", "sets, params, options, constraints = clf[0..3]"),
+    ("split", "Split data by class and vendor", "split_data_by_class_and_vnd(...)"),
+    ("optimize", "Run optimization", "results = run_optimization(...)"),
+    ("save", "Save results_output.pkl", "pickle.dump(results, f)"),
+    ("upload", "Upload results to GCS", "s_client.upload_file_to_gcs(...)"),
+]
+
+
+def product_class(product_type: str) -> str:
+    return PRODUCT_CLASSES.get(str(product_type).split("-")[0], "Other")
+
+
+def build_query_parameters(products, capacity, limits, settings):
+    """Pipeline steps 1–2 (separate scripts in the real repo): build the 4 objects stored in query_parameters.pkl."""
+    dem_cols = [f"demand_{z}" for z in ZONES]
+    tot = products[dem_cols].sum(axis=1)
+    groups = {"ok": [], "low_vel": [], "no_demand": [], "restricted": []}
+    for i, r in products.iterrows():
+        if tot[i] == 0 and r["order_qty"] > 0:
+            groups["no_demand"].append(r["product_type"])
+        elif r["rule"] == "must_be_in":
+            groups["restricted"].append(r["product_type"])
+        elif r["velocity"] == "low":
+            groups["low_vel"].append(r["product_type"])
+        else:
+            groups["ok"].append(r["product_type"])
+    costs, _ = build_costs(products, settings)
+    sets = {"cfcs": list(WAREHOUSES), "destinations": list(ZONES), "storages": list(STORAGE_TYPES),
+            "products": groups}
+    params = {
+        "costs": costs,
+        "demand": {(z, r["product_type"]): float(r[f"demand_{z}"]) for _, r in products.iterrows() for z in ZONES},
+        "supply": dict(zip(products["product_type"], (tot + products["order_qty"]).astype(float))),
+        "product_storage": dict(zip(products["product_type"], products["storage"])),
+        "product_table": products.copy(),
+    }
+    options = {"settings": asdict(settings), "storage_sizes": {}}
+    constraints = {
+        "storage": capacity.copy(),
+        "min_alloc": (limits["min_pct"] / 100).to_dict(),
+        "max_alloc": (limits["max_pct"] / 100).to_dict(),
+        "exceptions": products.loc[products["rule"] != "", ["product_type", "rule", "rule_cfcs"]].reset_index(drop=True),
+        "med_velocity": products.loc[products["velocity"] == "medium",
+                                     ["product_type", "allowed_cfcs"]].reset_index(drop=True),
+    }
+    return (sets, params, options, constraints)
+
+
+def split_data_by_class_and_vnd(sets, params, constraints, classes):
+    """Keep only the products whose class is in `classes` (demo version of the repo helper)."""
+    keep = {p for p in params["product_table"]["product_type"] if product_class(p) in classes}
+    sets = dict(sets, products={g: [p for p in ps if p in keep] for g, ps in sets["products"].items()})
+    params = dict(params,
+                  costs={k: v for k, v in params["costs"].items() if k[2] in keep},
+                  demand={k: v for k, v in params["demand"].items() if k[1] in keep},
+                  supply={k: v for k, v in params["supply"].items() if k in keep},
+                  product_storage={k: v for k, v in params["product_storage"].items() if k in keep},
+                  product_table=params["product_table"][params["product_table"]["product_type"].isin(keep)]
+                  .reset_index(drop=True))
+    constraints = dict(constraints,
+                       exceptions=constraints["exceptions"][constraints["exceptions"]["product_type"].isin(keep)],
+                       med_velocity=constraints["med_velocity"][constraints["med_velocity"]["product_type"].isin(keep)])
+    return sets, params, constraints
+
+
+def run_optimization(sets, params, constraints, options):
+    """Demo version of src.optim.optimization.run_optimization: rules + LP via run_allocation()."""
+    products = params["product_table"]
+    capacity = constraints["storage"]
+    limits = pd.DataFrame({"min_pct": pd.Series(constraints["min_alloc"]) * 100,
+                           "max_pct": pd.Series(constraints["max_alloc"]) * 100}).loc[sets["cfcs"]]
+    settings = Settings(**options["settings"])
+    return run_allocation(products, capacity, limits, settings, previous_slow_map=last_approved_slow_map())
+
+
+def _tracker(state: dict) -> str:
+    out = []
+    for i, (key, label, _) in enumerate(PIPE_STEPS, 1):
+        s = state.get(key, "todo")
+        badge = {"todo": "gray", "run": "blue", "done": "green", "fail": "red"}[s]
+        mark = {"todo": "", "run": "… ", "done": "✓ ", "fail": "✕ "}[s]
+        out.append(f":{badge}-badge[{mark}{i} · {label}]")
+    return " → ".join(out)
+
+
+def page_pipeline():
+    st.markdown("## Pipeline run · `model_main.py`")
+    st.caption("Runs `execute_model()` step by step, the way the production job does: download the inputs, "
+               "unpack them, split by class, optimize, save and upload the results. Demo mode: BigQuery and "
+               "GCS are simulated and the inputs come from the sample data.")
+
+    with st.expander("Run settings", expanded=True):
+        c1, c2, c3 = st.columns([1, 1, 2])
+        env = c1.selectbox("Environment", ["dev", "prod"], key="pipe_env",
+                           help="The original script hardcodes 'prod'. Here it's a setting.")
+        month = c2.selectbox("Target month", month_options(), key="pipe_month")
+        all_classes = sorted(set(PRODUCT_CLASSES.values()))
+        ss.setdefault("pipe_classes", all_classes)
+        ss.setdefault("pipe_use_setup", True)
+        classes = c3.multiselect("Product classes (split_data_by_class_and_vnd)", all_classes, key="pipe_classes")
+        use_setup = st.checkbox("Use the inputs edited on **Set up & run** (otherwise sample data)",
+                                key="pipe_use_setup")
+        st.markdown("**Config** (`config.PIPELINE_CONFIG()`)")
+        st.code("\n".join(f"{k} = {v!r}" for k, v in PIPELINE_CONFIG.items()), language="python")
+
+    with st.expander("How this maps to model_main.py"):
+        st.dataframe(pd.DataFrame([{"#": i, "Step": lbl, "Code in model_main.py": code}
+                                   for i, (_, lbl, code) in enumerate(PIPE_STEPS, 1)]),
+                     hide_index=True, width="stretch")
+
+    run_clicked = st.button("▶  Run execute_model()", type="primary", disabled=not classes)
+    if not classes:
+        st.caption("Pick at least one product class.")
+
+    if run_clicked:
+        _execute_model_demo(env, month, classes, use_setup)
+
+    last = ss.get("pipeline_last")
+    if last:
+        _render_pipeline_result(last)
+
+
+def _execute_model_demo(env, month, classes, use_setup):
+    state = {}
+    tracker = st.empty()
+    log_box = st.empty()
+    lines = []
+
+    def log(msg, level="INFO"):
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S,%f")[:-3]
+        lines.append(f"{ts} - root - {level} - {msg}")
+        log_box.code("\n".join(lines[-14:]), language="log")
+
+    def step(key):
+        state[key] = "run"
+        tracker.markdown(_tracker(state))
+        time.sleep(0.35)
+
+    def done(key):
+        state[key] = "done"
+        tracker.markdown(_tracker(state))
+
+    products = ss.get("products_df") if use_setup and "products_df" in ss else sample_products()
+    capacity = ss.get("capacity_df") if use_setup and "capacity_df" in ss else sample_capacity()
+    limits = ss.get("limits_df") if use_setup and "limits_df" in ss else sample_limits()
+    settings = Settings(
+        overflow_penalty=float(ss.get("penalty", 50.0)), time_limit_s=float(ss.get("time_limit", 60)),
+        slow_tie_break=ss.get("tie_break", "Lowest cost"), missing_cost_fill=ss.get("cost_fill", "Warehouse average"),
+        count_rule_stock_in_shares=bool(ss.get("count_rule", True)))
+
+    folder = GCS_DIR / PIPELINE_CONFIG["PROJECT_INTERIM_FOLDER"]
+    folder.mkdir(parents=True, exist_ok=True)
+    gs = f"gs://{PIPELINE_CONFIG['BUCKET_NAME']}/{PIPELINE_CONFIG['PROJECT_INTERIM_FOLDER']}"
+    art = {}
+    try:
+        # pipeline steps 1–2 happen in other scripts; in the demo we create their output file first
+        (folder / "query_parameters.pkl").write_bytes(
+            _pickle.dumps(build_query_parameters(products, capacity, limits, settings)))
+
+        step("connect")
+        log(f"Connected to BigQuery ({env}) as pdq, gbq_client [simulated]")
+        log("Beginning to run the OPTIMIZATION ...")
+        done("connect")
+
+        step("download")
+        local_file_path = "query_parameters.pkl"
+        raw = (folder / local_file_path).read_bytes()
+        log(f"Downloading {gs}/{local_file_path} -> ./{local_file_path} ({len(raw) / 1024:.1f} KB)")
+        log("Query parameters file download completed...")
+        done("download")
+
+        step("load")
+        clf = _pickle.loads(raw)
+        log(f"Loaded pickle: tuple of {len(clf)} objects")
+        done("load")
+
+        step("unpack")
+        sets, params, options, constraints = clf[0], clf[1], clf[2], clf[3]
+        log("Parameters of `sets`, `params`, `options`, `constraints` are loaded into memory")
+        art["before"] = {g: len(v) for g, v in sets["products"].items()}
+        art["sets"], art["params"], art["options"], art["constraints"] = sets, params, options, constraints
+        done("unpack")
+
+        step("split")
+        log("Determining which data is required at class level")
+        sets, params, constraints = split_data_by_class_and_vnd(sets, params, constraints, classes)
+        art["after"] = {g: len(v) for g, v in sets["products"].items()}
+        art["classes"] = classes
+        log(f"Kept {sum(art['after'].values())} of {sum(art['before'].values())} product types "
+            f"in classes: {', '.join(classes)}")
+        if not len(params["product_table"]):
+            raise ValueError("No products left after the class split")
+        done("split")
+
+        step("optimize")
+        results = run_optimization(sets, params, constraints, options)
+        k = results["kpis"]
+        log(f"OPTIMIZATION COMPLETED — status {k['status']}, cost ${k['total_cost']:,.0f}, "
+            f"{k['units']:,.0f} units, {k['overflow_units']:,.0f} overflow units",
+            "INFO" if k["status"] in ("Optimal", "Suboptimal") else "ERROR")
+        done("optimize")
+
+        step("save")
+        out_name = "results_output.pkl"
+        out_bytes = _pickle.dumps(results)
+        log(f"Results dumped to ./{out_name} ({len(out_bytes) / 1024:.1f} KB)")
+        done("save")
+
+        step("upload")
+        (folder / out_name).write_bytes(out_bytes)
+        log(f"Uploaded ./{out_name} -> {gs}/{out_name}")
+        done("upload")
+
+        run_id = "RUN-" + datetime.now().strftime("%y%m%d-%H%M%S")
+        save_run({
+            "id": run_id, "month": month, "created_by": ss["user"]["name"],
+            "created_by_user": ss["user"]["username"], "created_at": now(), "status": "Draft",
+            "source": "Pipeline (model_main.py)", "settings": asdict(settings),
+            "inputs": {"classes": classes, "env": env},
+            "results": serialise_results(results),
+            "history": [{"at": now(), "status": "Draft", "by": ss["user"]["name"]}],
+        })
+        log(f"Run saved as {run_id} (Draft)")
+        ss["pipeline_last"] = {"ok": True, "log": lines, "run_id": run_id, "art": art, "results": results,
+                               "query_bytes": raw, "results_bytes": out_bytes, "gs": gs, "env": env}
+    except Exception as e:  # show where it failed, like the job logs would
+        failed = next((key for key, *_ in PIPE_STEPS if state.get(key) == "run"), None)
+        if failed:
+            state[failed] = "fail"
+        tracker.markdown(_tracker(state))
+        log(f"{type(e).__name__}: {e}", "ERROR")
+        ss["pipeline_last"] = {"ok": False, "log": lines, "art": art, "error": str(e), "state": state}
+    tracker.empty()
+    log_box.empty()
+
+
+def _render_pipeline_result(last):
+    if last["ok"]:
+        st.markdown(_tracker({k: "done" for k, *_ in PIPE_STEPS}))
+        st.success(f"execute_model() finished · run **{last['run_id']}** saved as Draft "
+                   f"(environment: {last['env']})")
+    else:
+        st.markdown(_tracker(last.get("state", {})))
+        st.error(f"execute_model() failed: {last['error']}")
+    st.markdown("#### Log")
+    st.code("\n".join(last["log"]), language="log")
+    if not last["ok"]:
+        return
+
+    art, res = last["art"], last["results"]
+    t1, t2, t3, t4, t5, t6 = st.tabs(["sets", "params", "options", "constraints", "split", "results"])
+    with t1:
+        st.caption("`sets = clf[0]`: what the problem is about")
+        s = art["sets"]
+        c = st.columns(4)
+        c[0].metric("CFCs", len(s["cfcs"]))
+        c[1].metric("Destinations", len(s["destinations"]))
+        c[2].metric("Storage types", len(s["storages"]))
+        c[3].metric("Product types", sum(len(v) for v in s["products"].values()))
+        st.dataframe(pd.DataFrame([{"Group": g, "Count": len(v), "Product types": ", ".join(v)}
+                                   for g, v in s["products"].items()]), hide_index=True, width="stretch")
+    with t2:
+        st.caption("`params = clf[1]`: costs, demand, supply and the product → storage map")
+        p = art["params"]
+        dem = pd.Series(p["demand"]).unstack(0)[ZONES]
+        dem["storage"] = pd.Series(p["product_storage"])
+        st.markdown("**Demand by product and zone**")
+        st.dataframe(dem, width="stretch")
+        st.markdown("**Shipping cost per unit (first product type)**")
+        first = next(iter(p["product_storage"]))
+        cost = pd.DataFrame({z: {w: p["costs"][(w, z, first)] for w in WAREHOUSES} for z in ZONES})
+        st.caption(first)
+        st.dataframe(cost.round(2), width="stretch")
+    with t3:
+        st.caption("`options = clf[2]`: run settings")
+        st.json(art["options"])
+    with t4:
+        st.caption("`constraints = clf[3]`: space, warehouse shares, exceptions, medium-velocity limits")
+        cs = art["constraints"]
+        a, b = st.columns(2)
+        a.markdown("**Storage capacity**")
+        a.dataframe(cs["storage"], width="stretch")
+        b.markdown("**Min / max share**")
+        b.dataframe(pd.DataFrame({"min": cs["min_alloc"], "max": cs["max_alloc"]}), width="stretch")
+        a.markdown("**Exceptions**")
+        a.dataframe(cs["exceptions"], hide_index=True, width="stretch")
+        b.markdown("**Medium velocity (allowed CFCs)**")
+        b.dataframe(cs["med_velocity"], hide_index=True, width="stretch")
+    with t5:
+        st.caption(f"Classes kept: {', '.join(art['classes'])}")
+        st.dataframe(pd.DataFrame({"Before split": art["before"], "After split": art["after"]}),
+                     width="stretch")
+    with t6:
+        k = res["kpis"]
+        c = st.columns(4)
+        c[0].metric("Solver", k["status"], border=True)
+        c[1].metric("Shipping cost", f"${k['total_cost']:,.0f}", border=True)
+        c[2].metric("Units", f"{k['units']:,.0f}", border=True)
+        c[3].metric("Overflow units", f"{k['overflow_units']:,.0f}", border=True)
+        st.dataframe(res["summary"], hide_index=True, width="stretch")
+        d1, d2, d3 = st.columns(3)
+        d1.download_button("Download query_parameters.pkl", last["query_bytes"], "query_parameters.pkl",
+                           width="stretch")
+        d2.download_button("Download results_output.pkl", last["results_bytes"], "results_output.pkl",
+                           width="stretch")
+        if d3.button("Open in Plan →", type="primary", width="stretch"):
+            goto("Plan", last["run_id"])
+        st.caption(f"Files in the (simulated) bucket: {last['gs']}/query_parameters.pkl, "
+                   f"{last['gs']}/results_output.pkl")
+
+
+
+# ======================================================================================
+# Publish to BigQuery — write approved optimizer outputs to BigQuery tables
+# Demo mode (default): a local SQLite file stands in for the BigQuery dataset.
+# Production mode: add [gcp_service_account] (+ optional [bigquery]) to Streamlit secrets
+# and `google-cloud-bigquery`, `pyarrow` to requirements.txt.
+# ======================================================================================
+import re as _re
+import sqlite3 as _sqlite3
+
+BQ_DEMO_DB = DATA_DIR / "bigquery_demo.sqlite"
+
+BQ_TABLES = {
+    "allocation_plan": {
+        "desc": "One row per warehouse × zone × product: units to stock and ship, cost and how it was decided.",
+        "schema": [("run_id", "STRING"), ("target_month", "DATE"), ("warehouse", "STRING"), ("zone", "STRING"),
+                   ("product_type", "STRING"), ("storage", "STRING"), ("units", "FLOAT64"),
+                   ("unit_cost", "FLOAT64"), ("cost", "FLOAT64"), ("method", "STRING"),
+                   ("published_at", "TIMESTAMP")]},
+    "capacity_summary": {
+        "desc": "Space used per warehouse × storage type, with overflow above capacity.",
+        "schema": [("run_id", "STRING"), ("target_month", "DATE"), ("warehouse", "STRING"), ("storage", "STRING"),
+                   ("allocated", "FLOAT64"), ("capacity", "FLOAT64"), ("used_pct", "FLOAT64"),
+                   ("overflow", "FLOAT64"), ("published_at", "TIMESTAMP")]},
+    "warehouse_share": {
+        "desc": "Each warehouse's share of all units vs its min / max target.",
+        "schema": [("run_id", "STRING"), ("target_month", "DATE"), ("warehouse", "STRING"), ("units", "FLOAT64"),
+                   ("share_pct", "FLOAT64"), ("min_pct", "FLOAT64"), ("max_pct", "FLOAT64"),
+                   ("published_at", "TIMESTAMP")]},
+    "run_log": {
+        "desc": "One row per published run: solver status, KPIs, who ran / approved / published it, settings.",
+        "schema": [("run_id", "STRING"), ("target_month", "DATE"), ("run_status", "STRING"),
+                   ("solver_status", "STRING"), ("total_cost", "FLOAT64"), ("units", "FLOAT64"),
+                   ("optimizer_units", "FLOAT64"), ("rule_units", "FLOAT64"), ("overflow_units", "FLOAT64"),
+                   ("penalty_cost", "FLOAT64"), ("created_by", "STRING"), ("created_at", "STRING"),
+                   ("approved_by", "STRING"), ("approved_at", "STRING"), ("published_by", "STRING"),
+                   ("published_at", "TIMESTAMP"), ("settings_json", "STRING"), ("warnings_json", "STRING")]},
+}
+_ID_PROJECT = _re.compile(r"^[a-z][a-z0-9-]{4,28}[a-z0-9]$")
+_ID_NAME = _re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,127}$")
+
+
+def bq_secrets() -> dict:
+    try:
+        return dict(st.secrets["bigquery"]) if "bigquery" in st.secrets else {}
+    except Exception:
+        return {}
+
+
+def bq_live() -> bool:
+    try:
+        return "gcp_service_account" in st.secrets
+    except Exception:
+        return False
+
+
+def target_month_date(month_label: str) -> str:
+    try:
+        return datetime.strptime(month_label, "%B %Y").date().isoformat()
+    except ValueError:
+        return date.today().replace(day=1).isoformat()
+
+
+def build_output_tables(run: dict, published_by: str, published_at: str) -> dict:
+    res = deserialise_results(run["results"])
+    k = res["kpis"]
+    month = target_month_date(run["month"])
+    common = {"run_id": run["id"], "target_month": month}
+
+    def frame(df, name):
+        df = df.copy()
+        for c, v in common.items():
+            df[c] = v
+        df["published_at"] = published_at
+        cols = [c for c, _ in BQ_TABLES[name]["schema"]]
+        for c in cols:
+            if c not in df.columns:
+                df[c] = None
+        return df[cols].reset_index(drop=True)
+
+    tables = {
+        "allocation_plan": frame(res["detail"], "allocation_plan"),
+        "capacity_summary": frame(res["summary"], "capacity_summary"),
+        "warehouse_share": frame(res["shares"], "warehouse_share"),
+        "run_log": pd.DataFrame([{
+            **common, "run_status": run["status"], "solver_status": k["status"],
+            "total_cost": k["total_cost"], "units": k["units"], "optimizer_units": k["optimizer_units"],
+            "rule_units": k["rule_units"], "overflow_units": k["overflow_units"], "penalty_cost": k["penalty_cost"],
+            "created_by": run.get("created_by"), "created_at": run.get("created_at"),
+            "approved_by": run.get("decided_by") if run["status"] == "Approved" else None,
+            "approved_at": run.get("decided_at") if run["status"] == "Approved" else None,
+            "published_by": published_by, "published_at": published_at,
+            "settings_json": json.dumps(run.get("settings", {})),
+            "warnings_json": json.dumps(run["results"].get("warnings", [])),
+        }])[[c for c, _ in BQ_TABLES["run_log"]["schema"]]],
+    }
+    return tables
+
+
+def publish_checks(run, tables, project, dataset, table_names, allow_unapproved) -> list[dict]:
+    out = []
+    approved = run["status"] == "Approved"
+    out.append({"level": "ok" if approved else ("warn" if allow_unapproved else "error"),
+                "text": "Run is approved" if approved else f"Run is {run['status']}, not approved"})
+    ok_ids = bool(_ID_PROJECT.match(project or "")) and bool(_ID_NAME.match(dataset or "")) and \
+        all(_ID_NAME.match(t or "") for t in table_names.values())
+    out.append({"level": "ok" if ok_ids else "error",
+                "text": "Project, dataset and table names are valid" if ok_ids
+                else "Check names: project = lower-case letters/digits/hyphens (6–30), dataset/table = letters, digits, _"})
+    plan = tables["allocation_plan"]
+    k = run["results"]["kpis"]
+    match = abs(plan["units"].sum() - k["units"]) < 1
+    out.append({"level": "ok" if match else "error",
+                "text": f"Plan rows add up to the run total ({plan['units'].sum():,.0f} units)"})
+    neg = int((plan["units"] < 0).sum())
+    out.append({"level": "ok" if not neg else "error", "text": "No negative units" if not neg else f"{neg} rows with negative units"})
+    nulls = int(plan[["warehouse", "product_type", "method"]].isna().sum().sum())
+    out.append({"level": "ok" if not nulls else "error",
+                "text": "No missing keys (warehouse, product, method)" if not nulls else f"{nulls} missing key values"})
+    out.append({"level": "ok" if k["status"] == "Optimal" else "warn", "text": f"Solver status: {k['status']}"})
+    if k.get("overflow_units"):
+        out.append({"level": "warn", "text": f"{k['overflow_units']:,.0f} overflow units will be published as planned"})
+    return out
+
+
+# ---------- demo backend: SQLite pretending to be a BigQuery dataset -------------------
+def _demo_table(dataset, table):
+    return f"{dataset}__{table}"
+
+
+def demo_publish(tables, dataset, table_names, month, mode) -> dict:
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    rows = {}
+    with _sqlite3.connect(BQ_DEMO_DB) as con:
+        for key, df in tables.items():
+            t = _demo_table(dataset, table_names[key])
+            exists = con.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (t,)).fetchone()
+            if exists and mode == "replace":
+                con.execute(f'DELETE FROM "{t}" WHERE target_month = ?', (month,))
+            df.to_sql(t, con, if_exists="append", index=False)
+            rows[key] = len(df)
+    return rows
+
+
+def demo_query(sql: str, project: str, dataset: str) -> pd.DataFrame:
+    q = sql.strip().rstrip(";")
+    if not _re.match(r"(?is)^\s*(select|with)\b", q) or ";" in q:
+        raise ValueError("Only a single SELECT query is allowed here.")
+    q = q.replace("`", "")
+    q = _re.sub(rf"\b{_re.escape(project)}\.{_re.escape(dataset)}\.(\w+)", rf"{dataset}__\1", q)
+    q = _re.sub(rf"\b{_re.escape(dataset)}\.(\w+)", rf"{dataset}__\1", q)
+    con = _sqlite3.connect(f"file:{BQ_DEMO_DB}?mode=ro", uri=True)
+    try:
+        return pd.read_sql_query(q, con)
+    finally:
+        con.close()
+
+
+def demo_inventory(dataset) -> pd.DataFrame:
+    if not BQ_DEMO_DB.exists():
+        return pd.DataFrame()
+    out = []
+    with _sqlite3.connect(BQ_DEMO_DB) as con:
+        names = [r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type='table' AND name LIKE ?",
+                                           (f"{dataset}__%",))]
+        for n in names:
+            cnt, months, runs = con.execute(
+                f'SELECT COUNT(*), COUNT(DISTINCT target_month), COUNT(DISTINCT run_id) FROM "{n}"').fetchone()
+            out.append({"Table": f"{dataset}.{n.split('__', 1)[1]}", "Rows": cnt, "Months": months, "Runs": runs})
+    return pd.DataFrame(out)
+
+
+# ---------- production backend: google-cloud-bigquery -----------------------------------
+def bq_client(project: str, location: str):
+    from google.cloud import bigquery
+    from google.oauth2 import service_account
+    info = dict(st.secrets["gcp_service_account"])
+    creds = service_account.Credentials.from_service_account_info(info)
+    return bigquery.Client(project=project or info.get("project_id"), credentials=creds, location=location)
+
+
+def bq_publish(client, tables, project, dataset, table_names, month, mode, location) -> dict:
+    from google.cloud import bigquery
+    client.create_dataset(bigquery.Dataset(f"{project}.{dataset}"), exists_ok=True)
+    rows = {}
+    for key, df in tables.items():
+        table_id = f"{project}.{dataset}.{table_names[key]}"
+        schema = [bigquery.SchemaField(n, t) for n, t in BQ_TABLES[key]["schema"]]
+        tbl = bigquery.Table(table_id, schema=schema)
+        tbl.time_partitioning = bigquery.TimePartitioning(type_=bigquery.TimePartitioningType.MONTH,
+                                                          field="target_month")
+        tbl.description = BQ_TABLES[key]["desc"]
+        client.create_table(tbl, exists_ok=True)
+        if mode == "replace":
+            client.query(f"DELETE FROM `{table_id}` WHERE target_month = @m",
+                         job_config=bigquery.QueryJobConfig(query_parameters=[
+                             bigquery.ScalarQueryParameter("m", "DATE", month)])).result()
+        df = df.copy()
+        df["target_month"] = pd.to_datetime(df["target_month"]).dt.date
+        df["published_at"] = pd.to_datetime(df["published_at"])
+        job = client.load_table_from_dataframe(df, table_id, job_config=bigquery.LoadJobConfig(
+            schema=schema, write_disposition=bigquery.WriteDisposition.WRITE_APPEND))
+        job.result()
+        rows[key] = job.output_rows
+    return rows
+
+
+def add_publication(run_id: str, pub: dict):
+    with _LOCK:
+        runs = _read()
+        for r in runs:
+            if r["id"] == run_id:
+                r.setdefault("publications", []).append(pub)
+                r.setdefault("history", []).append({"at": pub["at"], "status": "Published to BigQuery",
+                                                    "by": pub["by"]})
+        _write(runs)
+
+
+def page_publish():
+    live = bq_live()
+    cfg = bq_secrets()
+    st.markdown("## Publish to BigQuery")
+    st.caption("Write the optimizer outputs of an approved run to BigQuery, so reports and downstream jobs "
+               "can read them.")
+    if live:
+        st.success(f"Connected mode — writing to real BigQuery with the service account in secrets.",
+                   icon=":material/cloud_done:")
+    else:
+        st.info("**Demo mode** — a local BigQuery simulator stands in for the dataset. Nothing leaves this app. "
+                "Add a service account to secrets to publish for real.", icon=":material/science:")
+
+    # ---- 1. run --------------------------------------------------------------------------
+    st.markdown("#### 1 · Choose the run")
+    runs = list_runs()
+    allow = st.checkbox("Include runs that are not approved yet (demo only)", value=not live and
+                        not any(r["status"] == "Approved" for r in runs), disabled=live, key="pub_allow")
+    eligible = [r for r in runs if r["status"] == "Approved" or (allow and not live)]
+    if not eligible:
+        st.warning("No approved runs yet. Run an allocation, submit it, and have the approver approve it.")
+        return
+    ids = [r["id"] for r in eligible]
+    sel = ss.get("selected_run")
+    rid = st.selectbox("Run", ids, index=ids.index(sel) if sel in ids else 0,
+                       format_func=lambda i: run_label(next(r for r in eligible if r["id"] == i)))
+    run = get_run(rid)
+    k = run["results"]["kpis"]
+    c = st.columns(4)
+    c[0].metric("Month", run["month"])
+    c[1].metric("Status", run["status"])
+    c[2].metric("Units", f"{k['units']:,.0f}")
+    c[3].metric("Shipping cost", f"${k['total_cost']:,.0f}")
+    for p in run.get("publications", []):
+        st.caption(f"Published before: {p['at']} by {p['by']} → `{p['target']}` ({p['mode']})")
+
+    # ---- 2. destination --------------------------------------------------------------------
+    st.markdown("#### 2 · Destination")
+    d1, d2, d3, d4 = st.columns([1.3, 1.1, 0.8, 1.4])
+    project = d1.text_input("GCP project", value=cfg.get("project", "demo-allocation-project"), key="pub_project")
+    dataset = d2.text_input("Dataset", value=cfg.get("dataset", "com_allocation"), key="pub_dataset")
+    location = d3.text_input("Location", value=cfg.get("location", "US"), key="pub_location")
+    mode_label = d4.radio("Write mode", ["Replace this month's rows", "Append"], key="pub_mode",
+                          help="Replace deletes rows for the same target month first, so re-publishing never "
+                               "creates duplicates.")
+    mode = "replace" if mode_label.startswith("Replace") else "append"
+    tbl_cfg = pd.DataFrame([{"publish": True, "output": key, "table": key, "meaning": v["desc"]}
+                            for key, v in BQ_TABLES.items()])
+    tbl_cfg = st.data_editor(tbl_cfg, hide_index=True, width="stretch", key="pub_tables",
+                             disabled=["output", "meaning"],
+                             column_config={"publish": st.column_config.CheckboxColumn("Publish", width="small"),
+                                            "output": "Optimizer output", "table": "BigQuery table name",
+                                            "meaning": st.column_config.TextColumn("What it holds", width="large")})
+    chosen = {r["output"]: r["table"] for _, r in tbl_cfg.iterrows() if r["publish"]}
+
+    # ---- 3. preview -----------------------------------------------------------------------
+    published_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    tables = build_output_tables(run, ss["user"]["name"], published_at)
+    st.markdown("#### 3 · Preview")
+    if chosen:
+        tabs = st.tabs([f"{chosen[k_]} · {len(tables[k_])} rows" for k_ in chosen])
+        for tab, key in zip(tabs, chosen):
+            with tab:
+                st.caption(f"`{project}.{dataset}.{chosen[key]}` — partitioned by month on `target_month`")
+                st.dataframe(tables[key].head(200), hide_index=True, width="stretch")
+                with st.expander("Schema"):
+                    st.dataframe(pd.DataFrame(BQ_TABLES[key]["schema"], columns=["column", "type"]),
+                                 hide_index=True, width="stretch")
+    else:
+        st.caption("Select at least one table.")
+
+    # ---- 4. checks + publish --------------------------------------------------------------
+    st.markdown("#### 4 · Checks")
+    checks = publish_checks(run, tables, project, dataset, chosen or {"x": "x"}, allow and not live)
+    icon = {"ok": ":green[✓]", "warn": ":orange[!]", "error": ":red[✕]"}
+    for ch in checks:
+        st.markdown(f"{icon[ch['level']]} &nbsp; {ch['text']}")
+    blocked = any(ch["level"] == "error" for ch in checks) or not chosen
+    month = target_month_date(run["month"])
+    if st.button(f"Publish {len(chosen)} table(s) to BigQuery", type="primary", disabled=blocked):
+        sub = {k_: tables[k_] for k_ in chosen}
+        try:
+            with st.spinner("Writing to BigQuery…"):
+                if live:
+                    rows = bq_publish(bq_client(project, location), sub, project, dataset, chosen, month, mode,
+                                      location)
+                else:
+                    rows = demo_publish(sub, dataset, chosen, month, mode)
+            add_publication(run["id"], {"at": published_at, "by": ss["user"]["name"], "mode": mode,
+                                        "target": f"{project}.{dataset}", "rows": rows,
+                                        "backend": "bigquery" if live else "demo"})
+            ss["pub_last"] = {"rows": rows, "target": f"{project}.{dataset}", "names": chosen, "run_id": run["id"]}
+            st.rerun()
+        except ModuleNotFoundError:
+            st.error("google-cloud-bigquery is not installed. Add `google-cloud-bigquery` and `pyarrow` "
+                     "to requirements.txt.")
+        except Exception as e:
+            st.error(f"Publish failed: {type(e).__name__}: {e}")
+
+    last = ss.get("pub_last")
+    if last and last["run_id"] == run["id"]:
+        st.success("Published to `{}`: ".format(last["target"]) +
+                   ", ".join(f"**{last['names'][k_]}** {n:,} rows" for k_, n in last["rows"].items()))
+
+    # ---- 5. what's there now ----------------------------------------------------------------
+    st.markdown("#### 5 · Published data")
+    if live:
+        st.caption(f"Open BigQuery console → `{project}.{dataset}` to see the tables.")
+    else:
+        inv = demo_inventory(dataset)
+        if inv.empty:
+            st.caption("Nothing published to this dataset yet.")
+        else:
+            st.dataframe(inv, hide_index=True, width="stretch")
+            plan_tbl = chosen.get("allocation_plan", "allocation_plan")
+            default_sql = (f"SELECT warehouse, storage, ROUND(SUM(units)) AS units, ROUND(SUM(cost)) AS cost\n"
+                           f"FROM `{project}.{dataset}.{plan_tbl}`\n"
+                           f"WHERE target_month = '{month}'\nGROUP BY warehouse, storage\nORDER BY warehouse, storage")
+            sql = st.text_area("Query the published tables (BigQuery-style SQL, SELECT only)", value=default_sql,
+                               height=150, key=f"pub_sql_{dataset}")
+            if st.button("Run query"):
+                try:
+                    st.dataframe(demo_query(sql, project, dataset), hide_index=True, width="stretch")
+                except Exception as e:
+                    st.error(f"{type(e).__name__}: {e}")
+
+    with st.expander("Code used in connected mode"):
+        st.code('''from google.cloud import bigquery
+client = bigquery.Client(project=PROJECT, credentials=creds, location=LOCATION)
+client.create_dataset(f"{PROJECT}.{DATASET}", exists_ok=True)
+table = bigquery.Table(table_id, schema=schema)
+table.time_partitioning = bigquery.TimePartitioning(type_="MONTH", field="target_month")
+client.create_table(table, exists_ok=True)
+# replace mode: remove this month's rows first, so re-publishing never duplicates
+client.query(f"DELETE FROM `{table_id}` WHERE target_month = @m", job_config=...).result()
+client.load_table_from_dataframe(df, table_id,
+    job_config=bigquery.LoadJobConfig(schema=schema, write_disposition="WRITE_APPEND")).result()''',
+                language="python")
+        st.markdown("Secrets for connected mode:")
+        st.code('''[gcp_service_account]   # the service-account JSON key, field by field
+type = "service_account"
+project_id = "your-project"
+private_key_id = "..."
+private_key = "-----BEGIN PRIVATE KEY-----\\n...\\n-----END PRIVATE KEY-----\\n"
+client_email = "allocation-app@your-project.iam.gserviceaccount.com"
+token_uri = "https://oauth2.googleapis.com/token"
+
+[bigquery]
+project = "your-project"
+dataset = "com_allocation"
+location = "US"''', language="toml")
+
+
+
+# ======================================================================================
 # Main
 # ======================================================================================
 def main():
@@ -1058,8 +1765,9 @@ def main():
                 del ss[k]
             st.rerun()
 
-    {"Set up & run": page_setup, "Plan": page_plan, "Warnings": page_warnings,
-     "Run history": page_history, "Approvals": page_approvals}[ss["page"]]()
+    {"Set up & run": page_setup, "Pipeline run": page_pipeline, "Plan": page_plan, "Warnings": page_warnings,
+     "Run history": page_history, "Approvals": page_approvals,
+     "Publish to BigQuery": page_publish}[ss["page"]]()
 
 
 main()
